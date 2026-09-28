@@ -1098,6 +1098,12 @@ if uploaded_file is not None:
                     "acceptance thresholds."
                 )
 
+    except Exception as exc:
+
+        st.error(
+            f"Prediction failed: {exc}"
+        )
+
 else:
 
     st.caption(
