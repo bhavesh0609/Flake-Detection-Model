@@ -963,13 +963,18 @@ def predict_image(
 # 10. USER INTERFACE
 # ============================================================
 
+# Keep the on-page previews compact.  The downloadable PNG is
+# still generated at the full output resolution.
+DISPLAY_WIDTH = 680
+INPUT_DISPLAY_WIDTH = 520
+
 st.title(
     "🔬 GaSe Flake Analyzer"
 )
 
 st.write(
-    "Upload a GaSe microscope image to segment flakes "
-    "and classify their optical appearance."
+    "Upload a GaSe microscope image or an entire folder of images "
+    "to segment flakes and classify their optical appearance."
 )
 
 st.info(
@@ -977,135 +982,482 @@ st.info(
     "train or modify the models."
 )
 
-uploaded_file = st.file_uploader(
-    "Upload microscope image",
-    type=[
-        "jpg",
-        "jpeg",
-        "png",
-        "bmp",
-        "tif",
-        "tiff",
+upload_mode = st.radio(
+    "Input mode",
+    [
+        "Single image",
+        "Multiple images",
+        "Entire folder",
     ],
+    horizontal=True,
 )
 
-if uploaded_file is not None:
+# Clear stale batch results whenever the user switches input mode.
+if st.session_state.get("last_upload_mode") != upload_mode:
+    st.session_state["batch_results"] = None
+    st.session_state["last_upload_mode"] = upload_mode
 
-    try:
+SUPPORTED_TYPES = [
+    "jpg",
+    "jpeg",
+    "png",
+    "bmp",
+    "tif",
+    "tiff",
+]
 
-        pil_image = Image.open(
-            uploaded_file
-        ).convert("RGB")
 
-        input_array = np.array(
-            pil_image
-        )
+# ------------------------------------------------------------
+# SINGLE IMAGE MODE
+# ------------------------------------------------------------
+if upload_mode == "Single image":
 
-        st.subheader(
-            "Input"
-        )
+    uploaded_file = st.file_uploader(
+        "Upload microscope image",
+        type=SUPPORTED_TYPES,
+        accept_multiple_files=False,
+        key="single_image_uploader",
+    )
 
-        st.image(
-            input_array,
-            width="stretch"
-        )
+    if uploaded_file is not None:
 
-        if st.button(
-            "Predict",
-            type="primary",
-        ):
+        try:
 
-            with st.spinner(
-                "Running YOLOv8n + appearance classifier..."
-            ):
+            pil_image = Image.open(
+                uploaded_file
+            ).convert("RGB")
 
-                (
-                    output_image,
-                    png_bytes,
-                    detections,
-                    raw_count,
-                    kept_count,
-                ) = predict_image(
-                    input_array
-                )
+            input_array = np.array(
+                pil_image
+            )
 
             st.subheader(
-                "Prediction"
+                "Input"
             )
 
             st.image(
-                output_image,
-                width="stretch"
+                input_array,
+                width=INPUT_DISPLAY_WIDTH,
+            )
+
+            st.caption(
+                f"File: {uploaded_file.name}"
+            )
+
+            if st.button(
+                "Predict",
+                type="primary",
+                key="predict_single",
+            ):
+
+                with st.spinner(
+                    "Running YOLOv8n + appearance classifier..."
+                ):
+
+                    (
+                        output_image,
+                        png_bytes,
+                        detections,
+                        raw_count,
+                        kept_count,
+                    ) = predict_image(
+                        input_array
+                    )
+
+                st.subheader(
+                    "Prediction"
+                )
+
+                st.image(
+                    output_image,
+                    width=DISPLAY_WIDTH,
+                )
+
+                st.download_button(
+                    label="⬇️ Download prediction PNG",
+                    data=png_bytes,
+                    file_name=(
+                        Path(uploaded_file.name).stem
+                        + "_prediction.png"
+                    ),
+                    mime="image/png",
+                    key="download_single",
+                )
+
+                st.subheader(
+                    "Prediction details"
+                )
+
+                col1, col2, col3 = st.columns(3)
+
+                col1.metric(
+                    "Raw YOLO candidates",
+                    raw_count,
+                )
+
+                col2.metric(
+                    "After deduplication",
+                    kept_count,
+                )
+
+                col3.metric(
+                    "Accepted flakes",
+                    len(detections),
+                )
+
+                if detections:
+
+                    rows = []
+
+                    for i, det in enumerate(
+                        detections,
+                        start=1
+                    ):
+                        rows.append({
+                            "Flake":
+                                f"F{i:02d}",
+                            "Class":
+                                det["class_name"],
+                            "Probability":
+                                f"{det['probability']:.3f}",
+                            "YOLO confidence":
+                                f"{det['yolo_confidence']:.3f}",
+                        })
+
+                    st.table(
+                        rows
+                    )
+
+                else:
+
+                    st.warning(
+                        "No flake passed the current "
+                        "acceptance thresholds."
+                    )
+
+        except Exception as exc:
+
+            st.error(
+                f"Prediction failed: {exc}"
+            )
+
+
+# ------------------------------------------------------------
+# MULTIPLE INDIVIDUAL IMAGES MODE
+# ------------------------------------------------------------
+elif upload_mode == "Multiple images":
+
+    uploaded_files = st.file_uploader(
+        "Upload multiple microscope images",
+        type=SUPPORTED_TYPES,
+        accept_multiple_files=True,
+        key="multiple_image_uploader",
+        help=(
+            "Select multiple image files. The model will process "
+            "every uploaded image when you click Predict All."
+        ),
+    )
+
+    if uploaded_files:
+
+        st.caption(
+            f"{len(uploaded_files)} image(s) selected."
+        )
+
+        if st.button(
+            "Predict All",
+            type="primary",
+            key="predict_multiple",
+        ):
+
+            results = []
+            progress = st.progress(0)
+            status = st.empty()
+
+            for index, uploaded_file in enumerate(
+                uploaded_files,
+                start=1
+            ):
+
+                try:
+
+                    pil_image = Image.open(
+                        uploaded_file
+                    ).convert("RGB")
+
+                    input_array = np.array(
+                        pil_image
+                    )
+
+                    status.write(
+                        f"Processing {index}/{len(uploaded_files)}: "
+                        f"{uploaded_file.name}"
+                    )
+
+                    (
+                        output_image,
+                        png_bytes,
+                        detections,
+                        raw_count,
+                        kept_count,
+                    ) = predict_image(
+                        input_array
+                    )
+
+                    results.append({
+                        "name": uploaded_file.name,
+                        "output_image": output_image,
+                        "png_bytes": png_bytes,
+                        "detections": detections,
+                        "raw_count": raw_count,
+                        "kept_count": kept_count,
+                        "error": None,
+                    })
+
+                except Exception as exc:
+
+                    results.append({
+                        "name": uploaded_file.name,
+                        "output_image": None,
+                        "png_bytes": None,
+                        "detections": [],
+                        "raw_count": 0,
+                        "kept_count": 0,
+                        "error": str(exc),
+                    })
+
+                progress.progress(
+                    index / len(uploaded_files)
+                )
+
+            status.empty()
+            progress.empty()
+
+            st.session_state["batch_results"] = results
+
+
+# ------------------------------------------------------------
+# ENTIRE FOLDER MODE
+# ------------------------------------------------------------
+else:
+
+    uploaded_folder = st.file_uploader(
+        "Upload an entire image folder",
+        type=SUPPORTED_TYPES,
+        accept_multiple_files="directory",
+        key="folder_uploader",
+        help=(
+            "Choose a folder. Images inside the folder and its "
+            "subfolders will be uploaded and processed."
+        ),
+    )
+
+    if uploaded_folder:
+
+        st.caption(
+            f"{len(uploaded_folder)} image(s) found in the selected folder."
+        )
+
+        if st.button(
+            "Predict Entire Folder",
+            type="primary",
+            key="predict_folder",
+        ):
+
+            results = []
+            progress = st.progress(0)
+            status = st.empty()
+
+            for index, uploaded_file in enumerate(
+                uploaded_folder,
+                start=1
+            ):
+
+                try:
+
+                    pil_image = Image.open(
+                        uploaded_file
+                    ).convert("RGB")
+
+                    input_array = np.array(
+                        pil_image
+                    )
+
+                    status.write(
+                        f"Processing {index}/{len(uploaded_folder)}: "
+                        f"{uploaded_file.name}"
+                    )
+
+                    (
+                        output_image,
+                        png_bytes,
+                        detections,
+                        raw_count,
+                        kept_count,
+                    ) = predict_image(
+                        input_array
+                    )
+
+                    results.append({
+                        "name": uploaded_file.name,
+                        "output_image": output_image,
+                        "png_bytes": png_bytes,
+                        "detections": detections,
+                        "raw_count": raw_count,
+                        "kept_count": kept_count,
+                        "error": None,
+                    })
+
+                except Exception as exc:
+
+                    results.append({
+                        "name": uploaded_file.name,
+                        "output_image": None,
+                        "png_bytes": None,
+                        "detections": [],
+                        "raw_count": 0,
+                        "kept_count": 0,
+                        "error": str(exc),
+                    })
+
+                progress.progress(
+                    index / len(uploaded_folder)
+                )
+
+            status.empty()
+            progress.empty()
+
+            st.session_state["batch_results"] = results
+
+
+# ============================================================
+# BATCH RESULT DISPLAY
+# ============================================================
+
+batch_results = st.session_state.get(
+    "batch_results",
+    None
+)
+
+if batch_results:
+
+    st.divider()
+
+    st.header(
+        "Batch prediction results"
+    )
+
+    successful = sum(
+        result["error"] is None
+        for result in batch_results
+    )
+
+    failed = len(batch_results) - successful
+
+    col1, col2, col3 = st.columns(3)
+
+    col1.metric(
+        "Images processed",
+        len(batch_results),
+    )
+
+    col2.metric(
+        "Successful",
+        successful,
+    )
+
+    col3.metric(
+        "Failed",
+        failed,
+    )
+
+    # Use two columns so a folder with many images does not create
+    # an unnecessarily tall page.  Each individual result keeps its
+    # own PNG download button.
+    result_columns = st.columns(2)
+
+    for index, result in enumerate(
+        batch_results,
+        start=1
+    ):
+
+        column = result_columns[
+            (index - 1) % 2
+        ]
+
+        with column:
+
+            st.markdown(
+                f"### {index}. {result['name']}"
+            )
+
+            if result["error"] is not None:
+
+                st.error(
+                    f"Failed: {result['error']}"
+                )
+
+                continue
+
+            st.image(
+                result["output_image"],
+                width=DISPLAY_WIDTH,
             )
 
             st.download_button(
                 label="⬇️ Download prediction PNG",
-                data=png_bytes,
+                data=result["png_bytes"],
                 file_name=(
-                    "gase_flake_prediction.png"
+                    Path(result["name"]).stem
+                    + "_prediction.png"
                 ),
                 mime="image/png",
+                key=f"download_batch_{index}",
             )
 
-            st.subheader(
-                "Prediction details"
+            metric_a, metric_b, metric_c = st.columns(3)
+
+            metric_a.metric(
+                "Raw",
+                result["raw_count"],
             )
 
-            col1, col2, col3 = st.columns(3)
-
-            col1.metric(
-                "Raw YOLO candidates",
-                raw_count,
+            metric_b.metric(
+                "Dedup",
+                result["kept_count"],
             )
 
-            col2.metric(
-                "After deduplication",
-                kept_count,
+            metric_c.metric(
+                "Accepted",
+                len(result["detections"]),
             )
 
-            col3.metric(
-                "Accepted flakes",
-                len(detections),
-            )
-
-            if detections:
+            if result["detections"]:
 
                 rows = []
 
-                for i, det in enumerate(
-                    detections,
+                for flake_index, det in enumerate(
+                    result["detections"],
                     start=1
                 ):
                     rows.append({
                         "Flake":
-                            f"F{i:02d}",
+                            f"F{flake_index:02d}",
                         "Class":
                             det["class_name"],
                         "Probability":
                             f"{det['probability']:.3f}",
-                        "YOLO confidence":
-                            f"{det['yolo_confidence']:.3f}",
                     })
 
-                st.table(
-                    rows
+                st.dataframe(
+                    rows,
+                    hide_index=True,
+                    use_container_width=True,
                 )
 
             else:
 
-                st.warning(
-                    "No flake passed the current "
-                    "acceptance thresholds."
+                st.caption(
+                    "No accepted flakes."
                 )
 
-    except Exception as exc:
-
-        st.error(
-            f"Prediction failed: {exc}"
-        )
-
-else:
-
-    st.caption(
-        "Supported image formats: JPG, JPEG, PNG, BMP, TIFF."
-    )
